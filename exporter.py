@@ -1,12 +1,36 @@
 #!/usr/bin/env python3
-"""Export OpenCode chat sessions into training-ready JSONL.
+"""Export OpenCode chat sessions into a training-ready JSONL dataset.
 
 The exporter reads OpenCode's local SQLite database and emits one JSON object
-per turn (a user prompt plus the assistant trajectory that answered it). It
-reads the *materialized* `message` and `part` tables, which hold the final,
-consolidated state of every message and part. This avoids the streaming event
-log (`event`), where each part is written many times as it streams, so tool
-calls, tool results and text are captured exactly once and in order.
+per session in the widely used Hugging Face chat format: a `messages` list of
+`{role, content}` objects (the field trainers consume via a chat template).
+Tool use follows the OpenAI convention — assistant `tool_calls` plus
+`role: "tool"` results paired by `tool_call_id`. Assistant reasoning is inlined
+as `<think>...</think>` at the start of the assistant content, the convention
+used by OLMo 3 / Dolci-Think SFT data.
+
+It reads the *materialized* `message` and `part` tables (the final consolidated
+state of each message and part), not the streaming `event` log where each part
+is rewritten many times as it streams. This keeps text and tool calls from
+being duplicated by streaming updates.
+
+Record schema (one line per session):
+
+    {
+      "id": "ses_...",                 # session id
+      "source": "opencode",            # origin identifier (see --source)
+      "agent": "coder",                # metadata: the agent that produced it
+      "model": "provider/model-id",    # metadata
+      "messages": [
+        {"role": "system", "content": "..."},        # only if --prompts-dir resolves it
+        {"role": "user", "content": "..."},
+        {"role": "assistant", "content": "<think>...</think>",
+         "tool_calls": [{"id": "...", "type": "function",
+                         "function": {"name": "bash", "arguments": "{...}"}}]},
+        {"role": "tool", "tool_call_id": "...", "content": "..."},
+        {"role": "assistant", "content": "Final answer."}
+      ]
+    }
 
 Standard library only; no external dependencies.
 """
@@ -21,10 +45,13 @@ from pathlib import Path
 # --- Configuration (environment variables override the defaults) -------------
 DB_PATH = os.getenv("OPENCODE_DB_PATH", os.path.expanduser("~/.local/share/opencode/opencode.db"))
 OUTPUT_FILE = os.getenv("OPENCODE_OUTPUT_PATH", os.path.expanduser("~/opencode_training_data.jsonl"))
+# Value written to each record's `source` field (dataset-origin identifier).
+SOURCE = os.getenv("OPENCODE_SOURCE", "opencode")
 # Optional: a directory of `{agent}.md` system-prompt files. When set, the
-# exporter attaches the matching agent prompt as `system` on a best-effort
-# basis. The system prompt is NOT stored in the OpenCode DB (see README), so it
-# is empty unless this directory is provided and contains a file for the agent.
+# exporter prepends the matching agent prompt as a `system` message on a
+# best-effort basis. The system prompt is NOT stored in the OpenCode DB (see
+# README), so no system message is emitted unless this directory is provided
+# and contains a file for the agent.
 PROMPTS_DIR = os.getenv("OPENCODE_PROMPTS_DIR", "")
 
 # Part types that carry no training content; they are structural markers.
@@ -69,8 +96,22 @@ def _load_prompt(agent, cache):
     return text
 
 
+def _tool_arguments(value):
+    """Tool-call arguments as a JSON string (the OpenAI function-calling form)."""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return "{}"
+
+
 def _steps_from_parts(parts):
-    """Turn an assistant message's ordered parts into trajectory steps."""
+    """Turn an assistant message's ordered parts into trajectory steps.
+
+    A single OpenCode tool part holds BOTH the call (state.input) and the result
+    (state.output), so it becomes two steps: a `tool_call` and a `tool_result`.
+    """
     steps = []
     for part in parts:
         ptype = part.get("type")
@@ -86,27 +127,20 @@ def _steps_from_parts(parts):
                 steps.append({"kind": "text", "text": text})
         elif ptype == "tool":
             tool = part.get("tool") or ""
+            call_id = part.get("callID") or part.get("id") or ""
             state = part.get("state") or {}
             status = state.get("status")
             tool_input = state.get("input")
             if tool_input is None:
                 tool_input = {}
-            steps.append({"kind": "tool_call", "tool": tool, "input": tool_input})
+            steps.append({"kind": "tool_call", "tool": tool, "call_id": call_id, "input": tool_input})
             output = state.get("output")
             if output:
-                steps.append({
-                    "kind": "tool_result",
-                    "tool": tool,
-                    "status": status or "completed",
-                    "output": output,
-                })
+                steps.append({"kind": "tool_result", "tool": tool, "call_id": call_id,
+                              "status": status or "completed", "output": output})
             elif status == "error":
-                steps.append({
-                    "kind": "tool_result",
-                    "tool": tool,
-                    "status": "error",
-                    "output": state.get("error") or "",
-                })
+                steps.append({"kind": "tool_result", "tool": tool, "call_id": call_id,
+                              "status": "error", "output": state.get("error") or ""})
     return steps
 
 
@@ -120,13 +154,78 @@ def _user_text_from_parts(parts):
     return "\n".join(chunks)
 
 
-def build_records(conn):
-    """Yield one training record per turn across all sessions."""
+def _assistant_content(think_texts, body_texts):
+    """Assemble assistant content: inline `<think>...</think>` then the answer."""
+    parts = []
+    think = "\n\n".join(t for t in think_texts if t).strip()
+    if think:
+        parts.append(f"<think>{think}</think>")
+    body = "\n\n".join(t for t in body_texts if t).strip()
+    if body:
+        parts.append(body)
+    return "\n".join(parts)
+
+
+def _steps_to_messages(steps):
+    """Convert an ordered assistant trajectory into OpenAI-style chat messages.
+
+    reasoning/text accumulate into an assistant message's content; a `tool_call`
+    attaches to that message's `tool_calls`; a `tool_result` becomes a
+    `role: "tool"` message. A new assistant/tool exchange begins when fresh
+    reasoning/text/tool_call arrives after a tool result was produced.
+    """
+    messages = []
+    think_buf, text_buf, tool_calls, tool_results = [], [], [], []
+    synth = [0]
+
+    def flush():
+        content = _assistant_content(think_buf, text_buf)
+        if content or tool_calls:
+            msg = {"role": "assistant", "content": content}
+            if tool_calls:
+                msg["tool_calls"] = list(tool_calls)
+            messages.append(msg)
+        for tid, out in tool_results:
+            messages.append({"role": "tool", "tool_call_id": tid, "content": out})
+        think_buf.clear()
+        text_buf.clear()
+        tool_calls.clear()
+        tool_results.clear()
+
+    def new_id():
+        synth[0] += 1
+        return f"call_{synth[0]}"
+
+    for step in steps:
+        kind = step["kind"]
+        if kind in ("reasoning", "text", "tool_call") and tool_results:
+            flush()
+        if kind == "reasoning":
+            think_buf.append(step["text"])
+        elif kind == "text":
+            text_buf.append(step["text"])
+        elif kind == "tool_call":
+            cid = step.get("call_id") or new_id()
+            tool_calls.append({
+                "id": cid,
+                "type": "function",
+                "function": {"name": step.get("tool") or "", "arguments": _tool_arguments(step.get("input"))},
+            })
+        elif kind == "tool_result":
+            cid = step.get("call_id") or (tool_calls[-1]["id"] if tool_calls else new_id())
+            tool_results.append((cid, step.get("output") or ""))
+    flush()
+    return messages
+
+
+def build_records(conn, source):
+    """Yield one training record (a full session conversation) per session."""
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
-    # messages grouped by session, in chronological order
+    # messages grouped by session, in chronological order (preserve first-seen order)
     messages_by_session = {}
+    session_order = []
     for row in cur.execute(
         "SELECT id, session_id, data FROM message ORDER BY time_created ASC, id ASC"
     ):
@@ -134,7 +233,11 @@ def build_records(conn):
             data = json.loads(row["data"])
         except (json.JSONDecodeError, TypeError):
             continue
-        messages_by_session.setdefault(row["session_id"], []).append((row["id"], data))
+        sid = row["session_id"]
+        if sid not in messages_by_session:
+            messages_by_session[sid] = []
+            session_order.append(sid)
+        messages_by_session[sid].append((row["id"], data))
 
     # parts grouped by message, in order
     parts_by_message = {}
@@ -147,74 +250,54 @@ def build_records(conn):
             continue
         parts_by_message.setdefault(row["message_id"], []).append(data)
 
-    for session_id, messages in messages_by_session.items():
-        turn = None
+    prompt_cache = {}
 
-        def flush(t):
-            if t is None:
-                return None
-            has_content = any(
-                s["kind"] in ("text", "tool_call", "tool_result")
-                for s in t["trajectory"]
-            )
-            if not t["user"].strip() or not has_content:
-                return None
-            return t
+    for session_id in session_order:
+        out_messages = []
+        pending = []          # assistant steps across consecutive assistant messages
+        agent = ""
+        model = ""
 
-        for msg_id, data in messages:
+        for msg_id, data in messages_by_session[session_id]:
             role = data.get("role")
             parts = parts_by_message.get(msg_id, [])
             if role == "user":
-                # A new user message after a completed exchange starts a new turn.
-                if turn is not None and turn["trajectory"]:
-                    ready = flush(turn)
-                    if ready:
-                        yield ready
-                    turn = None
-                if turn is None:
-                    turn = {
-                        "session_id": session_id,
-                        "agent": None,
-                        "model": None,
-                        "system": "",
-                        "user": "",
-                        "assistant": "",
-                        "trajectory": [],
-                    }
+                if pending:
+                    out_messages.extend(_steps_to_messages(pending))
+                    pending = []
                 utext = _user_text_from_parts(parts)
                 if utext:
-                    turn["user"] = (turn["user"] + "\n" + utext).strip() if turn["user"] else utext
+                    out_messages.append({"role": "user", "content": utext})
             elif role == "assistant":
-                if turn is None:
-                    turn = {
-                        "session_id": session_id,
-                        "agent": None,
-                        "model": None,
-                        "system": "",
-                        "user": "",
-                        "assistant": "",
-                        "trajectory": [],
-                    }
-                if turn["agent"] is None:
-                    turn["agent"] = data.get("agent") or ""
-                    turn["model"] = _model_id(data.get("model"))
-                turn["trajectory"].extend(_steps_from_parts(parts))
+                if not agent:
+                    agent = data.get("agent") or ""
+                    model = _model_id(data.get("model"))
+                pending.extend(_steps_from_parts(parts))
+        if pending:
+            out_messages.extend(_steps_to_messages(pending))
 
-        ready = flush(turn)
-        if ready:
-            yield ready
+        # keep only sessions with usable assistant content
+        has_assistant = any(
+            m["role"] == "assistant" and (m.get("content") or m.get("tool_calls"))
+            for m in out_messages
+        )
+        if not has_assistant:
+            continue
+
+        system = _load_prompt(agent, prompt_cache)
+        if system:
+            out_messages.insert(0, {"role": "system", "content": system})
+
+        yield {
+            "id": session_id,
+            "source": source,
+            "agent": agent,
+            "model": model,
+            "messages": out_messages,
+        }
 
 
-def finalize(record, prompt_cache):
-    """Fill in the convenience `assistant` field and best-effort `system`."""
-    record["assistant"] = "\n".join(
-        s["text"] for s in record["trajectory"] if s["kind"] == "text"
-    )
-    record["system"] = _load_prompt(record.get("agent"), prompt_cache)
-    return record
-
-
-def export_data(append=False):
+def export_data(append=False, source="opencode"):
     if not os.path.exists(DB_PATH):
         print(f"Database not found at {DB_PATH}", file=sys.stderr)
         return 1
@@ -231,15 +314,13 @@ def export_data(append=False):
                 file=sys.stderr,
             )
             return 1
-        prompt_cache = {}
         seen = set()
         records = []
-        for rec in build_records(conn):
-            rec = finalize(rec, prompt_cache)
-            line = json.dumps(rec, ensure_ascii=False, sort_keys=True)
-            if line in seen:
+        for rec in build_records(conn, source):
+            key = json.dumps(rec, ensure_ascii=False, sort_keys=True)
+            if key in seen:
                 continue
-            seen.add(line)
+            seen.add(key)
             records.append(json.dumps(rec, ensure_ascii=False))
     finally:
         conn.close()
@@ -270,7 +351,7 @@ def export_data(append=False):
                 existing.add(key)
                 f.write(line + "\n")
                 written += 1
-        print(f"Appended {written} new rows to {OUTPUT_FILE} ({len(records)} unique turns in DB)")
+        print(f"Appended {written} new sessions to {OUTPUT_FILE} ({len(records)} unique sessions in DB)")
     else:
         # Clean rebuild: atomic replace so a running OpenCode/readers never see
         # a half-written file, and re-running yields an identical output.
@@ -279,7 +360,7 @@ def export_data(append=False):
             for line in records:
                 f.write(line + "\n")
         os.replace(tmp, OUTPUT_FILE)
-        print(f"Exported {len(records)} turns to {OUTPUT_FILE}")
+        print(f"Exported {len(records)} sessions to {OUTPUT_FILE}")
     return 0
 
 
@@ -287,6 +368,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Export OpenCode sessions to training JSONL.")
     parser.add_argument("--db", help="Path to opencode.db (overrides OPENCODE_DB_PATH).")
     parser.add_argument("--output", help="Output JSONL path (overrides OPENCODE_OUTPUT_PATH).")
+    parser.add_argument("--source", help="Value for the record 'source' field (overrides OPENCODE_SOURCE).")
     parser.add_argument("--prompts-dir", help="Directory of {agent}.md system prompts (overrides OPENCODE_PROMPTS_DIR).")
     parser.add_argument(
         "--append",
@@ -302,8 +384,9 @@ def main(argv=None):
         OUTPUT_FILE = os.path.expanduser(args.output)
     if args.prompts_dir:
         PROMPTS_DIR = args.prompts_dir
+    source = args.source or SOURCE
 
-    return export_data(append=args.append)
+    return export_data(append=args.append, source=source)
 
 
 if __name__ == "__main__":
