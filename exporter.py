@@ -46,7 +46,6 @@ def export_data():
             last_seq = last_sequences.get(session_id, -1)
             
             # 1. Pre-calculate Role Map for this session
-            # We need all message roles to avoid expensive LIKE queries inside the loop
             role_map = {}
             cursor.execute("SELECT data FROM event WHERE aggregate_id = ? AND type = 'message.updated.1'", (session_id,))
             for row in cursor.fetchall():
@@ -60,6 +59,13 @@ def export_data():
                 except:
                     continue
 
+            # 2. Pre-calculate Context Epochs for this session
+            # Mapping: sequence_number -> baseline_text
+            epochs = {}
+            cursor.execute("SELECT baseline_seq, baseline FROM session_context_epoch WHERE session_id = ? ORDER BY baseline_seq ASC", (session_id,))
+            for row in cursor.fetchall():
+                epochs[row["baseline_seq"]] = row["baseline"]
+
             # Fetch events after the last exported sequence
             cursor.execute("SELECT * FROM event WHERE aggregate_id = ? AND seq > ? ORDER BY seq ASC", (session_id, last_seq))
             events = cursor.fetchall()
@@ -67,19 +73,36 @@ def export_data():
             if not events:
                 continue
 
-            # Initial system prompt (latest baseline)
-            cursor.execute("SELECT baseline FROM session_context_epoch WHERE session_id = ? ORDER BY baseline_seq DESC LIMIT 1", (session_id,))
-            epoch_row = cursor.fetchone()
-            system_prompt = epoch_row["baseline"] if epoch_row else ""
+            # Determine initial system prompt (the baseline active at the start of the exported window)
+            # We find the epoch with the highest sequence <= the first event's sequence
+            first_seq = events[0]["seq"]
+            active_baseline = ""
+            if epochs:
+                # Find the most recent epoch that occurred before or at first_seq
+                applicable_epochs = [seq for seq in epochs.keys() if seq <= first_seq]
+                if applicable_epochs:
+                    active_baseline = epochs[max(applicable_epochs)]
+                else:
+                    # If no epoch is found before the first event, take the very first epoch
+                    active_baseline = epochs[min(epochs.keys())] if epochs else ""
 
-            current_turn = {"session_id": session_id, "system": system_prompt, "user": "", "thought": "", "assistant": ""}
+            current_turn = {"session_id": session_id, "system": active_baseline, "user": "", "thought": "", "assistant": ""}
             
             for event in events:
                 etype = event["type"]
+                seq = event["seq"]
                 try:
                     data = json.loads(event["data"])
                 except:
                     continue
+
+                # Check if we've crossed into a new epoch
+                if etype == "session.next.epoch.admitted.1" or etype == "session.next.epoch.updated.1":
+                    # The event data contains the new baseline or a reference to it.
+                    # To be most accurate, we check if the current seq has a corresponding epoch entry
+                    if seq in epochs:
+                        active_baseline = epochs[seq]
+                        current_turn["system"] = active_baseline
 
                 if etype == "message.part.updated.1":
                     part = data.get("part", {})
@@ -90,12 +113,10 @@ def export_data():
                     role = role_map.get(msg_id, "unknown")
 
                     if role == "user":
-                        # If we already have a turn in progress (user + assistant), 
-                        # and we hit a NEW user message, the previous turn is complete.
                         if current_turn["user"] and current_turn["assistant"]:
                             outfile.write(json.dumps(current_turn) + "\n")
                             new_entries_count += 1
-                            current_turn = {"session_id": session_id, "system": system_prompt, "user": "", "thought": "", "assistant": ""}
+                            current_turn = {"session_id": session_id, "system": active_baseline, "user": "", "thought": "", "assistant": ""}
                         
                         current_turn["user"] += text
                     elif role == "assistant":
@@ -104,12 +125,8 @@ def export_data():
                         elif part_type == "text":
                             current_turn["assistant"] += text
 
-                # Handle turns that are just a prompt without a response yet, 
-                # or response without prompt (rare). 
-                # We only flush when a new user message starts or session ends.
-
             # Final turn for the session
-            if current_turn["user"]: # Export even if assistant is empty (incomplete turn)
+            if current_turn["user"]:
                 outfile.write(json.dumps(current_turn) + "\n")
                 new_entries_count += 1
 
