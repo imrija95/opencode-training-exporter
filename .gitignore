@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+
+# Data artifacts — never commit exported datasets or local databases
+*.db
+*.jsonl
+*.tmp
+export_state.json
