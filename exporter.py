@@ -18,7 +18,6 @@ def get_last_sequences():
     return {}
 
 def save_sequences(sequences):
-    # Ensure the directory for the state file exists
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     with open(STATE_FILE, "w") as f:
         json.dump(sequences, f)
@@ -33,7 +32,6 @@ def export_data():
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
-    # Get all sessions
     try:
         cursor.execute("SELECT id FROM session")
         sessions = [row["id"] for row in cursor.execute("SELECT id FROM session")]
@@ -47,26 +45,35 @@ def export_data():
         for session_id in sessions:
             last_seq = last_sequences.get(session_id, -1)
             
-            # Fetch all events for this session after the last exported sequence
+            # 1. Pre-calculate Role Map for this session
+            # We need all message roles to avoid expensive LIKE queries inside the loop
+            role_map = {}
+            cursor.execute("SELECT data FROM event WHERE aggregate_id = ? AND type = 'message.updated.1'", (session_id,))
+            for row in cursor.fetchall():
+                try:
+                    data = json.loads(row["data"])
+                    info = data.get("info", {})
+                    msg_id = info.get("id")
+                    role = info.get("role")
+                    if msg_id and role:
+                        role_map[msg_id] = role
+                except:
+                    continue
+
+            # Fetch events after the last exported sequence
             cursor.execute("SELECT * FROM event WHERE aggregate_id = ? AND seq > ? ORDER BY seq ASC", (session_id, last_seq))
             events = cursor.fetchall()
             
             if not events:
                 continue
 
-            # Group events into turns
-            # A turn starts with a user message and ends with an assistant response (including its reasoning)
-            current_turn = {"session_id": session_id, "system": "", "user": "", "thought": "", "assistant": ""}
-            
-            # We need to fetch the system context epoch for the session (simplified: take the latest one)
+            # Initial system prompt (latest baseline)
             cursor.execute("SELECT baseline FROM session_context_epoch WHERE session_id = ? ORDER BY baseline_seq DESC LIMIT 1", (session_id,))
             epoch_row = cursor.fetchone()
-            if epoch_row:
-                try:
-                    current_turn["system"] = epoch_row["baseline"]
-                except:
-                    pass
+            system_prompt = epoch_row["baseline"] if epoch_row else ""
 
+            current_turn = {"session_id": session_id, "system": system_prompt, "user": "", "thought": "", "assistant": ""}
+            
             for event in events:
                 etype = event["type"]
                 try:
@@ -80,20 +87,16 @@ def export_data():
                     part_type = part.get("type")
                     text = part.get("text", "")
 
-                    # Determine role by looking up message info
-                    cursor.execute("SELECT data FROM event WHERE aggregate_id = ? AND type = 'message.updated.1' AND data LIKE ?", 
-                                   (session_id, f'%"{msg_id}"%'))
-                    msg_row = cursor.fetchone()
-                    role = "unknown"
-                    if msg_row:
-                        try:
-                            msg_info = json.loads(msg_row["data"])
-                            # The event data for message.updated.1 contains a dict with 'info'
-                            role = msg_info.get("info", {}).get("role", "unknown")
-                        except:
-                            pass
+                    role = role_map.get(msg_id, "unknown")
 
                     if role == "user":
+                        # If we already have a turn in progress (user + assistant), 
+                        # and we hit a NEW user message, the previous turn is complete.
+                        if current_turn["user"] and current_turn["assistant"]:
+                            outfile.write(json.dumps(current_turn) + "\n")
+                            new_entries_count += 1
+                            current_turn = {"session_id": session_id, "system": system_prompt, "user": "", "thought": "", "assistant": ""}
+                        
                         current_turn["user"] += text
                     elif role == "assistant":
                         if part_type == "reasoning":
@@ -101,20 +104,15 @@ def export_data():
                         elif part_type == "text":
                             current_turn["assistant"] += text
 
-                # If we have both user and assistant content, and we hit a new user prompt or session end,
-                # we can consider the turn complete. 
-                if etype == "message.updated.1" and "user" in json.loads(event["data"]).get("info", {}).get("role", ""):
-                    if current_turn["user"] and current_turn["assistant"]:
-                        outfile.write(json.dumps(current_turn) + "\n")
-                        new_entries_count += 1
-                        current_turn = {"session_id": session_id, "system": current_turn["system"], "user": "", "thought": "", "assistant": ""}
-            
+                # Handle turns that are just a prompt without a response yet, 
+                # or response without prompt (rare). 
+                # We only flush when a new user message starts or session ends.
+
             # Final turn for the session
-            if current_turn["user"] and current_turn["assistant"]:
+            if current_turn["user"]: # Export even if assistant is empty (incomplete turn)
                 outfile.write(json.dumps(current_turn) + "\n")
                 new_entries_count += 1
 
-            # Update last sequence for this session
             if events:
                 last_sequences[session_id] = events[-1]["seq"]
 
