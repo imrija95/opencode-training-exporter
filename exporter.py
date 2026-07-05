@@ -60,7 +60,6 @@ def export_data():
                     continue
 
             # 2. Pre-calculate Context Epochs for this session
-            # Mapping: sequence_number -> baseline_text
             epochs = {}
             cursor.execute("SELECT baseline_seq, baseline FROM session_context_epoch WHERE session_id = ? ORDER BY baseline_seq ASC", (session_id,))
             for row in cursor.fetchall():
@@ -73,17 +72,14 @@ def export_data():
             if not events:
                 continue
 
-            # Determine initial system prompt (the baseline active at the start of the exported window)
-            # We find the epoch with the highest sequence <= the first event's sequence
+            # Determine initial system prompt
             first_seq = events[0]["seq"]
             active_baseline = ""
             if epochs:
-                # Find the most recent epoch that occurred before or at first_seq
                 applicable_epochs = [seq for seq in epochs.keys() if seq <= first_seq]
                 if applicable_epochs:
                     active_baseline = epochs[max(applicable_epochs)]
                 else:
-                    # If no epoch is found before the first event, take the very first epoch
                     active_baseline = epochs[min(epochs.keys())] if epochs else ""
 
             current_turn = {"session_id": session_id, "system": active_baseline, "user": "", "thought": "", "assistant": ""}
@@ -96,10 +92,7 @@ def export_data():
                 except:
                     continue
 
-                # Check if we've crossed into a new epoch
                 if etype == "session.next.epoch.admitted.1" or etype == "session.next.epoch.updated.1":
-                    # The event data contains the new baseline or a reference to it.
-                    # To be most accurate, we check if the current seq has a corresponding epoch entry
                     if seq in epochs:
                         active_baseline = epochs[seq]
                         current_turn["system"] = active_baseline
@@ -124,6 +117,19 @@ def export_data():
                             current_turn["thought"] += text
                         elif part_type == "text":
                             current_turn["assistant"] += text
+                        elif part_type == "tool":
+                            # Capture tool call info
+                            tool_name = part.get("tool", "")
+                            state = part.get("state", {})
+                            input_data = state.get("input", "")
+                            # Convert input to string if it's a dict
+                            if isinstance(input_data, dict):
+                                input_data = json.dumps(input_data)
+                            
+                            # Only append tool calls that have input (the 'pending' state usually has empty input)
+                            if input_data:
+                                tool_call = f"Call tool {tool_name} with input: {input_data}\n"
+                                current_turn["assistant"] += tool_call
 
             # Final turn for the session
             if current_turn["user"]:
